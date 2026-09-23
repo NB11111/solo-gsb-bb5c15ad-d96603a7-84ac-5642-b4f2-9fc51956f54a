@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PCR 引物互补性筛选台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <h1>🧬 PCR 引物互补性筛选台</h1>
+      <p class="subtitle">反向互补局部配对 · 发卡结构 / 引物二聚体检测 · 简化 Tm 阈值风险分级</p>
+    </div>
+  </header>
+
+  <main class="wrap layout">
+    <!-- ================= 左侧：输入 ================= -->
+    <section class="panel input-panel">
+      <h2>1. 引物与参数</h2>
+
+      <label class="field-label" for="jobName">任务备注（可选）</label>
+      <input id="jobName" type="text" maxlength="120" placeholder="例如：IL-6 qPCR 引物初筛" />
+
+      <div class="params">
+        <div>
+          <label class="field-label" for="salt">盐浓度 [Na⁺]（M）</label>
+          <input id="salt" type="number" value="0.05" min="0.001" max="1.5" step="0.01" />
+        </div>
+        <div>
+          <label class="field-label" for="temp">退火温度 / Tm 阈值（°C）</label>
+          <input id="temp" type="number" value="25.0" min="0" max="95" step="0.5" />
+        </div>
+        <div>
+          <label class="field-label" for="minbp">最小互补 bp 数</label>
+          <input id="minbp" type="number" value="4" min="3" max="30" step="1" />
+        </div>
+      </div>
+
+      <div class="json-row">
+        <label class="field-label" for="jsonInput">引物序列 JSON</label>
+        <div class="json-actions">
+          <button id="btnLoadExample" class="btn ghost" type="button">载入示例</button>
+          <button id="btnFormat" class="btn ghost" type="button">格式化</button>
+        </div>
+      </div>
+      <textarea id="jsonInput" spellcheck="false"
+        placeholder='[&#10;  {"id": "F1", "sequence": "GCATCG..."},&#10;  {"id": "R1", "sequence": "GCTAGC..."}&#10;]'></textarea>
+      <p class="hint">
+        接受两种格式：<code>[{"id":"F","sequence":"ACGT..."}]</code>，或扁平的
+        <code>{"F": "ACGT...", "R": "TGCA..."}</code>。仅允许 A/C/G/T。
+      </p>
+
+      <div class="run-row">
+        <button id="btnRun" class="btn primary" type="button">▶ 开始筛选</button>
+        <span id="inputMsg" class="msg"></span>
+      </div>
+
+      <div class="tm-note">
+        <strong>Tm 简化模型：</strong>Tm<sub>base</sub> = 4·(G+C) + 2·(A+T)（Wallace，基准约 50 mM Na⁺）；
+        Tm = Tm<sub>base</sub> + 16.6·log₁₀( f([Na⁺]) / f(0.05) )，f(x)=x/(1+0.7x)（SantaLucia 盐校正）。
+        风险分级：3′ 锚定且 Tm ≥ 阈值 → <em>critical</em>；Tm ≥ 阈值 → <em>high</em>；
+        Tm 在阈值以下 5 °C 内且配对 ≥8 bp → <em>medium</em>。
+      </div>
+    </section>
+
+    <!-- ================= 右侧：结果 ================= -->
+    <section class="panel result-panel">
+      <div class="result-head">
+        <h2>2. 筛选结果</h2>
+        <div class="result-actions">
+          <button id="btnExport" class="btn ghost" type="button" disabled>⬇ 导出 JSON</button>
+        </div>
+      </div>
+      <div id="emptyResult" class="empty">尚未执行筛选。粘贴引物、设置盐浓度与温度后点击「开始筛选」。</div>
+
+      <div id="resultBody" hidden>
+        <div id="overview" class="cards"></div>
+        <div id="discardBox" class="discard-box"></div>
+
+        <h3>🔻 发卡结构（Hairpin）</h3>
+        <div id="hairpinList" class="event-list"></div>
+
+        <h3>🔗 引物二聚体（Dimer）</h3>
+        <div id="dimerList" class="event-list"></div>
+
+        <!-- 条件敏感性分析 -->
+        <div id="sensitivityBox" class="sensitivity-box">
+          <div class="result-head">
+            <h3>🌡️ 条件敏感性分析（复用本任务引物）</h3>
+            <button id="btnSensExport" class="btn ghost tiny" type="button" disabled>⬇ 下载分析 JSON</button>
+          </div>
+          <p class="hint">
+            输入盐浓度与 Tm 阈值列表（各 ≤ 8 项、不可重复，组合 ≤ 64 格），
+            后端复用同一批引物逐格重算发卡/二聚体风险，并按事件类型、引物与配对区间对齐。
+          </p>
+          <div class="sens-params">
+            <div>
+              <label class="field-label" for="sensSalts">盐浓度 [Na⁺] 列表（M，逗号分隔，0.001–1.5）</label>
+              <input id="sensSalts" type="text" placeholder="0.01, 0.05, 0.15, 0.5" />
+            </div>
+            <div>
+              <label class="field-label" for="sensTemps">Tm 阈值列表（°C，逗号分隔，0–95）</label>
+              <input id="sensTemps" type="text" placeholder="20, 25, 30, 35, 40" />
+            </div>
+            <div class="sens-run">
+              <button id="btnSensRun" class="btn primary" type="button">▶ 分析</button>
+            </div>
+          </div>
+          <div id="sensMsg" class="msg"></div>
+          <div id="sensResult" hidden></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================= 历史 ================= -->
+  <section class="wrap panel history-panel">
+    <div class="result-head">
+      <h2>3. 历史任务（SQLite）</h2>
+      <button id="btnRefreshJobs" class="btn ghost" type="button">刷新</button>
+    </div>
+    <div id="jobList" class="job-list"></div>
+  </section>
+
+  <footer class="footer wrap">
+    <span>PCR Primer Complementarity Workbench · FastAPI + SQLite + 原生前端</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

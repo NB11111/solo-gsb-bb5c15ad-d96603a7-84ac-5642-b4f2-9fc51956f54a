@@ -1,0 +1,18 @@
+services:
+  pcr-screen:
+    build: .
+    image: pcr-primer-screen:latest
+    container_name: pcr-primer-screen
+    ports:
+      - "8000:8000"          # 宿主机端口:容器端口，宿主机端口可按需修改
+    environment:
+      # SQLite 数据库文件位置（容器内路径，挂载到 named volume 持久化）
+      PCR_DB_PATH: /data/jobs.db
+      # 可在此覆盖 uvicorn 并发相关配置（应用本身无其它必须的环境变量）
+    volumes:
+      - pcr-data:/data       # 任务历史持久化
+    restart: unless-stopped
+
+volumes:
+  pcr-data:
+    name: pcr-primer-screen-data

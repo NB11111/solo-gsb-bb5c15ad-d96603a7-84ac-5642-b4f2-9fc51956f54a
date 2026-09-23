@@ -1,0 +1,24 @@
+{
+  "name": "示例任务：1 条发卡引物 + 1 对 3' 互补引物 + 1 条正常引物",
+  "salt_conc": 0.05,
+  "temperature": 25.0,
+  "min_bp": 4,
+  "primers": [
+    {
+      "id": "Hairpin_F1",
+      "sequence": "GCATCGGATCGAATTTTATTCGATCCGATGC"
+    },
+    {
+      "id": "Primer_F2",
+      "sequence": "ATGCGTACGTTAGCGGATCCGGATCCGGAT"
+    },
+    {
+      "id": "Primer_R2",
+      "sequence": "TACGATCGATTACGGGATCCGGATCCGGAT"
+    },
+    {
+      "id": "Normal_F3",
+      "sequence": "GCTACAGTACGAGCTTGATC"
+    }
+  ]
+}
