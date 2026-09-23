@@ -10,6 +10,13 @@
 按事件类型、引物及配对区间对齐，以热力表标出 **首次达到 critical 的条件**，
 并提供每格分析 JSON 下载。
 
+任务结果页还提供 **多重 PCR 分池（Multiplex Pooling）**：从历史任务中勾选
+**2～12 条引物**、指定互不重叠的 **必须同池引物对** 与 **池数上限（2～6）**，
+后端按任务保存的盐浓度 / Tm 阈值 / min_bp **全量重算所选引物间的异源二聚体**
+（不读取可能已截断的筛选明细），任一 high/critical 位点即形成不可同池边；
+先将同池引物对折叠为分池单元，再搜索不超过上限的 **最少池数**，给出各池成员
+与冲突位点区间；单元内冲突或上限内无法分池时说明原因，绝不输出无效方案。
+
 技术栈：**FastAPI + SQLite + 原生 HTML/CSS/JS（零构建）**，Docker / Compose
 一键启动。
 
@@ -84,7 +91,10 @@ PCR_DB_PATH=./data/jobs.db uvicorn app.main:app --reload
 5. 在结果页底部 **「条件敏感性分析」** 输入盐浓度与 Tm 阈值列表，点击
    **「分析」** 查看热力表（★ 标出首次达到 critical 的条件），点击格子查看
    淘汰引物与相对原始条件的风险变化，并可 **「下载分析 JSON」**；
-6. 点击 **「导出 JSON」** 下载完整结构化结果；历史任务可在页面底部重新载入或删除。
+6. 在结果页底部 **「🧪 多重 PCR 分池」** 勾选 2～12 条引物、添加必须同池
+   引物对（互不重叠）并设置池数上限（2～6），点击 **「计算分池」** 查看各池
+   成员与冲突位点区间；调整配对或池数上限后可随时重算，并可下载分池 JSON；
+7. 点击 **「导出 JSON」** 下载完整结构化结果；历史任务可在页面底部重新载入或删除。
 
 ### 输入 JSON 格式
 
@@ -333,12 +343,129 @@ curl -s -X POST "http://localhost:8000/api/jobs/${JOB}/sensitivity" \
 
 ---
 
+## 三·补二、多重 PCR 分池
+
+针对一个 **已保存的历史任务**，选择其中 **2～12 条引物**、指定若干
+**互不重叠的必须同池引物对**（每条引物至多属于一对，最多 6 对）与
+**池数上限**（2～6），后端：
+
+1. 按任务保存的 **盐浓度 / Tm 阈值 / min_bp**，对所选引物 **全量重算**
+   所有两两 **异源二聚体**（自二聚体与发卡不影响同池约束）；
+2. 任一异源二聚体位点达到 `high` / `critical`，即在两条引物之间建立
+   **不可同池边**。配对几何与 Tm 全部实时重算，**不从筛选任务中可能已被
+   截断（每类事件上限 200 条）的事件明细推断冲突**；
+3. 用并查集把必须同池引物对 **折叠为分池单元**（未配对引物自成单元）；
+4. 单元内部存在冲突边（被强制同池的引物本身 high/critical）→ 直接判定
+   **无解并给出冲突位点**，不输出方案；
+5. 以单元为顶点建冲突图，从 1 池起做 **精确 k-着色**（DSATUR 回溯 + 颜色
+   对称剪枝），返回不超过上限的 **最少池数**；
+6. 上限内不可着色 → 返回精确色数下界、**最大两两冲突组（最大团）** 与全部
+   冲突明细，说明需要至少多少个池，**不输出任何无效方案**。
+
+> 分池方案为稳定输出：池按「成员中最早的引物在任务中的顺序」编号，同一输入
+> 每次结果一致。页面上调整勾选、同池对或池数上限后点击「计算分池」即可重算。
+
+### 请求
+
+`POST /api/jobs/{job_id}/multiplex`
+
+```json
+{
+  "primer_ids": ["Hairpin_F1", "Primer_F2", "Primer_R2", "Normal_F3"],
+  "force_pairs": [["Hairpin_F1", "Normal_F3"]],
+  "max_pools": 4
+}
+```
+
+- `primer_ids`：2～12 条，必须全部属于该任务，不可重复；
+- `force_pairs`：可省略或为空；每对两个不同 id；各对互不重叠；
+- `max_pools`：2～6 的整数。
+
+仓库提供可直接提交的
+[`examples/multiplex_request.json`](examples/multiplex_request.json)。
+
+```bash
+JOB=$(curl -s -X POST http://localhost:8000/api/screen \
+  -H 'Content-Type: application/json' \
+  -d @examples/sample_request.json | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
+
+curl -s -X POST "http://localhost:8000/api/jobs/${JOB}/multiplex" \
+  -H 'Content-Type: application/json' \
+  -d @examples/multiplex_request.json | python3 -m json.tool
+```
+
+### 错误响应
+
+| 状态码 | 触发条件 |
+| --- | --- |
+| `404` | `job_id` 不存在或已被删除 |
+| `422` | 选中引物数量不在 2–12 / 含重复或不属于该任务；同池对结构非法、自配对、重复或互相重叠；池数上限不在 2–6（响应体 `detail` 给出具体原因） |
+
+> 注意：`feasible: false`（单元内冲突 / 池数上限不足）属于 **正常业务结果**，
+> 返回 **200** 并在响应中给出 `reason`、人类可读的 `message` 与冲突/最大团
+> 诊断，而不是错误码。
+
+### 响应结构（节选）
+
+可行时：
+
+```jsonc
+{
+  "job_id": "80868ce2f218",
+  "multiplex": {
+    "salt_conc": 0.05, "temperature": 25.0, "min_bp": 4,
+    "primer_ids": ["Hairpin_F1", "Normal_F3", "Primer_F2", "Primer_R2"],
+    "primer_count": 4,
+    "units": [
+      { "unit_id": "u0", "members": ["Hairpin_F1", "Normal_F3"], "forced_pair": true, "pool": 1 },
+      { "unit_id": "u1", "members": ["Primer_F2"], "forced_pair": false, "pool": 1 },
+      { "unit_id": "u2", "members": ["Primer_R2"], "forced_pair": false, "pool": 2 }
+    ],
+    "force_pair_count": 1,
+    "max_pools": 4,
+    "pairs_scanned": 6,
+    "conflicting_primer_pairs": 1,
+    "feasible": true,
+    "reason": null,
+    "message": "在池数上限 4 内找到最少 2 池方案。",
+    "pool_count": 2,
+    "pools": [
+      { "pool": 1, "unit_ids": ["u0", "u1"], "members": ["Hairpin_F1", "Normal_F3", "Primer_F2"], "size": 3 },
+      { "pool": 2, "unit_ids": ["u2"], "members": ["Primer_R2"], "size": 1 }
+    ],
+    "conflicts": [
+      {
+        "primer_a": "Primer_F2", "primer_b": "Primer_R2",
+        "unit_a": "u1", "unit_b": "u2",
+        "pool_a": 1, "pool_b": 2, "same_pool": false,
+        "site_count": 2, "worst_risk": "critical",
+        "sites": [ /* 与筛选接口 dimer 事件同构：区间、bp、Tm、三行配对展示… */ ]
+      }
+    ]
+  }
+}
+```
+
+不可行时（`feasible: false`）不返回 `pools`，并附带：
+
+- `reason: "forced_pair_conflict"`：`forced_conflicts` 列出每个单元内部冲突
+  的同池对及其 high/critical 位点；
+- `reason: "pool_limit_exceeded"`：`chromatic_number`（冲突图精确色数）与
+  `max_clique`（最大两两冲突组的单元与成员，色数下界）。
+
+两种情况下 `conflicts` 都包含全量重算得到的 **全部** 不可同池引物对及位点
+区间（含 1-based 闭区间、bp/GC/Tm 与三行配对展示），不受 200 条事件上限
+影响。
+
+---
+
 ## 四、HTTP API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/screen` | 提交引物与参数，执行筛选并落库 |
 | `POST` | `/api/jobs/{job_id}/sensitivity` | 对历史任务执行盐浓度 × Tm 阈值条件敏感性分析 |
+| `POST` | `/api/jobs/{job_id}/multiplex` | 对历史任务中 2–12 条选中引物执行多重 PCR 分池 |
 | `GET` | `/api/example` | 获取内置示例请求体 |
 | `GET` | `/api/jobs` | 历史任务列表（最近 50 条） |
 | `GET` | `/api/jobs/{job_id}` | 某任务的请求 + 完整结果 |
@@ -367,7 +494,11 @@ curl -s http://localhost:8000/api/example | curl -s -X POST http://localhost:800
 4. 二聚体检测：自身（自二聚体，不要求环长）与两两异源配对，对称结果去重；
 5. 对每个互补段计算 Wallace + 盐校正 Tm，按上表分级并聚合成淘汰建议；
 6. 敏感性分析复用第 1–4 步的几何结果（配对几何只由序列与 `min_bp` 决定），
-   只对盐浓度/Tm 阈值逐格重算 Tm 与分级，因此事件按类型+引物+区间天然对齐。
+   只对盐浓度/Tm 阈值逐格重算 Tm 与分级，因此事件按类型+引物+区间天然对齐；
+7. 多重 PCR 分池按任务保存的条件 **重新执行** 第 1–5 步扫描所选引物的全部
+   两两异源二聚体（不读已截断明细），以 high/critical 位点为不可同池边；
+   必须同池对先经并查集折叠为单元，再对单元冲突图做精确 DSATUR k-着色，
+   从 1 池向上取不超过上限的最小可行池数，无解时以最大团给出色数下界。
 
 纯标准库实现，无 numpy/生物信息学重依赖；30 条约 20–28 nt 的引物全量
 （含所有两两组合）筛选约 0.4 秒。

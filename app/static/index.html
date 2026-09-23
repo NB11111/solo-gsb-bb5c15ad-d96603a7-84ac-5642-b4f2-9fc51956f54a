@@ -110,6 +110,47 @@
           <div id="sensMsg" class="msg"></div>
           <div id="sensResult" hidden></div>
         </div>
+
+        <!-- 多重 PCR 分池 -->
+        <div id="multiplexBox" class="multiplex-box">
+          <div class="result-head">
+            <h3>🧪 多重 PCR 分池（复用本任务条件全量重算）</h3>
+            <button id="btnMxExport" class="btn ghost tiny" type="button" disabled>⬇ 下载分池 JSON</button>
+          </div>
+          <p class="hint">
+            勾选 <b>2–12 条</b>本任务引物，指定互不重叠的<b>必须同池引物对</b>与
+            <b>池数上限（2–6）</b>。后端按任务保存的盐浓度（<b id="mxSalt"></b> M）、
+            Tm 阈值（<b id="mxTemp"></b> °C）、min_bp（<b id="mxMbp"></b>）
+            <b>全量重算所选引物间异源二聚体</b>（不读取可能已截断的筛选明细），
+            任一 high/critical 位点即构成不可同池边；先折叠同池对再搜索不超过上限的
+            <b>最少池数</b>。
+          </p>
+
+          <div class="mx-section">
+            <div class="mx-section-head">
+              <span class="mx-section-title">① 选择引物（<span id="mxCount">0</span>/2–12）</span>
+            </div>
+            <div id="mxPrimerPicker" class="mx-picker"></div>
+          </div>
+
+          <div class="mx-section">
+            <div class="mx-section-head">
+              <span class="mx-section-title">② 必须同池引物对（互不重叠，可留空）</span>
+              <button id="btnMxAddPair" class="btn ghost tiny" type="button">＋ 添加一对</button>
+            </div>
+            <div id="mxPairs" class="mx-pairs"></div>
+          </div>
+
+          <div class="mx-runrow">
+            <div class="mx-maxpools">
+              <label class="field-label" for="mxMaxPools">池数上限（2–6）</label>
+              <input id="mxMaxPools" type="number" value="4" min="2" max="6" step="1" />
+            </div>
+            <button id="btnMxRun" class="btn primary" type="button">▶ 计算分池</button>
+          </div>
+          <div id="mxMsg" class="msg"></div>
+          <div id="mxResult" hidden></div>
+        </div>
       </div>
     </section>
   </main>

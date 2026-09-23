@@ -1081,3 +1081,447 @@ def sensitivity_scan(
         "events_shown": len(events_out),
         "events_capped": len(items) > SENSITIVITY_EVENT_CAP,
     }
+
+
+# ---------------------------------------------------------------------------
+# 多重 PCR 分池
+# ---------------------------------------------------------------------------
+#
+# 多重 PCR 中，同一反应管（池）内的引物两两之间不能存在高风险异源二聚体。
+# 自二聚体 / 发卡是引物自身的性质，不影响它与哪条引物同池，故不参与分池
+# 约束。
+#
+# 关键正确性要求：冲突判定必须基于所选引物 **序列本身**、按任务保存的
+# 盐浓度 / Tm 阈值 / min_bp 全量重算所有两两异源二聚体——筛选结果中的
+# dimer 事件可能已被 EVENT_CAP 截断，不能据此推断「没有冲突」。
+#
+# 流程：
+#   1. 把用户指定的「必须同池」引物对用并查集折叠成单元（单元内引物共进退）；
+#   2. 全量重算选中引物间的异源二聚体，任一 high / critical 位点即在两条
+#      引物间形成「不可同池」边；
+#   3. 单元内部存在冲突边（被强制同池的两条引物本身冲突）→ 直接无解；
+#   4. 以单元为顶点、单元间任一引物冲突为边建图，从 1 池开始做精确 k-着色
+#      判定，取不超过池数上限的最小可行池数；
+#   5. 上限内不可着色 → 报告色数下界与最大两两冲突组（最大团），不给无效方案。
+
+MULTIPLEX_MIN_PRIMERS = 2
+MULTIPLEX_MAX_PRIMERS = 12
+MULTIPLEX_MIN_POOLS = 2
+MULTIPLEX_MAX_POOLS = 6
+# 互不重叠的同池对最多对数（12 条引物两两配对，最多 6 对）。
+MULTIPLEX_MAX_PAIRS = MULTIPLEX_MAX_PRIMERS // 2
+
+
+class MultiplexError(ValueError):
+    """分池请求的语义错误（选中引物 / 必须同池对不合法）。"""
+
+
+def _heterodimer_conflict_sites(
+    id_a: str,
+    seq_a: str,
+    id_b: str,
+    seq_b: str,
+    *,
+    salt_conc: float,
+    temperature: float,
+    min_bp: int,
+) -> list[dict]:
+    """全量重算一对不同引物间的异源二聚体，返回 high/critical 位点明细。"""
+
+    segs = scan_antiparallel(seq_a, seq_b, min_bp=min_bp)
+    events = _segments_to_dimers(
+        id_a,
+        seq_a,
+        id_b,
+        seq_b,
+        segs,
+        salt_conc=salt_conc,
+        temperature=temperature,
+    )
+    sites = [_dimer_to_dict(e) for e in events if e.risk in ("high", "critical")]
+    sites.sort(key=lambda d: (-_RISK_ORDER[d["risk"]], -d["tm"], -d["bp"]))
+    return sites
+
+
+def _exact_kcolor(n: int, adj: list[int], k: int) -> list[int] | None:
+    """判断 n 个顶点的图（adj 为邻接位掩码列表）是否可 k-着色。
+
+    可行时返回每个顶点的颜色（0..k-1），否则返回 None。采用 DSATUR 风格的
+    回溯：每步选择饱和度（相邻已用颜色数）最大的未着色顶点，并利用颜色
+    对称性只尝试「已出现颜色 + 一个新颜色」。分池场景 n ≤ 12，足够快。
+    """
+
+    if n == 0:
+        return []
+    if k <= 0:
+        return None
+    if k >= n:
+        # 顶点数不超过颜色数时任何图都可行（此处被调用意味着更小的 k 已失败）。
+        return list(range(n))
+
+    color = [-1] * n
+    deg = [adj[v].bit_count() for v in range(n)]
+
+    def backtrack(done: int) -> bool:
+        if done == n:
+            return True
+        best = -1
+        best_forbidden = 0
+        best_key: tuple | None = None
+        for v in range(n):
+            if color[v] != -1:
+                continue
+            forbidden = 0
+            bits = adj[v]
+            while bits:
+                b = bits & -bits
+                u = b.bit_length() - 1
+                if color[u] != -1:
+                    forbidden |= 1 << color[u]
+                bits ^= b
+            key = (forbidden.bit_count(), deg[v], -v)
+            if best_key is None or key > best_key:
+                best_key = key
+                best = v
+                best_forbidden = forbidden
+        if best_forbidden.bit_count() >= k:
+            return False
+        # 颜色对称：第 done 个着色的顶点至多使用「现有最高颜色 +1」。
+        highest = max((c for c in color if c != -1), default=-1)
+        for c in range(min(k, highest + 2)):
+            if not (best_forbidden & (1 << c)):
+                color[best] = c
+                if backtrack(done + 1):
+                    return True
+                color[best] = -1
+        return False
+
+    return color if backtrack(0) else None
+
+
+def _maximum_clique(n: int, adj: list[int]) -> list[int]:
+    """求最大团（Bron–Kerbosch + pivot 剪枝），返回顶点索引列表。n ≤ 12。"""
+
+    best: list[int] = []
+
+    def bronk(r: list[int], p: int, x: int) -> None:
+        if p == 0 and x == 0:
+            if len(r) > len(best):
+                best[:] = list(r)
+            return
+        pivot = -1
+        pivot_cnt = -1
+        bits = p | x
+        while bits:
+            b = bits & -bits
+            v = b.bit_length() - 1
+            cnt = (adj[v] & p).bit_count()
+            if cnt > pivot_cnt:
+                pivot, pivot_cnt = v, cnt
+            bits ^= b
+        candidates = p if pivot < 0 else (p & ~adj[pivot])
+        while candidates:
+            b = candidates & -candidates
+            v = b.bit_length() - 1
+            bit = 1 << v
+            bronk(r + [v], p & adj[v], x & adj[v])
+            p &= ~bit
+            x |= bit
+            candidates ^= b
+
+    bronk([], (1 << n) - 1, 0)
+    return sorted(best)
+
+
+def multiplex_partition(
+    primers: list[tuple[str, str]],
+    selected_ids: list[str],
+    force_pairs: list[tuple[str, str]] | list[list[str]],
+    max_pools: int,
+    *,
+    salt_conc: float,
+    temperature: float,
+    min_bp: int,
+) -> dict:
+    """对历史任务中选中的引物执行多重 PCR 分池。
+
+    ``force_pairs`` 为必须同池的引物对，要求两两互不重叠（每条引物至多出现
+    在一对中）。返回可直接序列化的分池方案或无解诊断。
+    """
+
+    # -- 输入语义校验 -------------------------------------------------------
+    known = [pid for pid, _ in primers]
+    order = {pid: i for i, pid in enumerate(known)}
+    known_set = set(known)
+
+    if not MULTIPLEX_MIN_PRIMERS <= len(selected_ids) <= MULTIPLEX_MAX_PRIMERS:
+        raise MultiplexError(
+            f"需要选择 {MULTIPLEX_MIN_PRIMERS}–{MULTIPLEX_MAX_PRIMERS} 条引物，"
+            f"当前为 {len(selected_ids)} 条"
+        )
+    if len(set(selected_ids)) != len(selected_ids):
+        raise MultiplexError("选中引物存在重复，请去重后再提交")
+    unknown = [pid for pid in selected_ids if pid not in known_set]
+    if unknown:
+        raise MultiplexError(f"以下引物不属于该任务：{'、'.join(unknown)}")
+    if not MULTIPLEX_MIN_POOLS <= max_pools <= MULTIPLEX_MAX_POOLS:
+        raise MultiplexError(
+            f"池数上限需在 {MULTIPLEX_MIN_POOLS}–{MULTIPLEX_MAX_POOLS} 之间"
+        )
+    if len(force_pairs) > MULTIPLEX_MAX_PAIRS:
+        raise MultiplexError(
+            f"必须同池引物对最多 {MULTIPLEX_MAX_PAIRS} 对（每条引物至多属于一对）"
+        )
+
+    selected = sorted(set(selected_ids), key=lambda pid: order[pid])
+    selected_set = set(selected)
+
+    norm_pairs: list[tuple[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    used: set[str] = set()
+    for pair in force_pairs:
+        a, b = pair[0], pair[1]
+        if a == b:
+            raise MultiplexError(f"必须同池引物对不能由同一条引物组成：{a}")
+        missing = [x for x in (a, b) if x not in selected_set]
+        if missing:
+            raise MultiplexError(
+                f"同池对 {a} × {b} 中的引物未被选中：{'、'.join(missing)}"
+            )
+        key = tuple(sorted((a, b), key=lambda pid: order[pid]))
+        if key in seen_pairs:
+            raise MultiplexError(f"同池对 {key[0]} × {key[1]} 重复指定")
+        overlap = [x for x in key if x in used]
+        if overlap:
+            raise MultiplexError(
+                f"必须同池引物对必须互不重叠，引物 {overlap[0]} 已出现在另一对中；"
+                "如需链式绑定请改为分多步或去掉重叠"
+            )
+        seen_pairs.add(key)
+        used.update(key)
+        norm_pairs.append(key)
+
+    # -- 1) 折叠必须同池对（并查集）----------------------------------------
+    parent = {pid: pid for pid in selected}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for a, b in norm_pairs:
+        union(a, b)
+
+    groups: dict[str, list[str]] = {}
+    for pid in selected:  # selected 已按任务顺序排列，组成员天然有序
+        groups.setdefault(find(pid), []).append(pid)
+    units = sorted(groups.values(), key=lambda mem: min(order[p] for p in mem))
+    unit_of = {pid: ui for ui, mem in enumerate(units) for pid in mem}
+
+    units_meta = [
+        {
+            "unit_id": f"u{ui}",
+            "members": mem,
+            "forced_pair": len(mem) > 1,
+        }
+        for ui, mem in enumerate(units)
+    ]
+    seq_of = dict(primers)
+
+    # -- 2) 按任务保存的条件全量重算两两异源二聚体 --------------------------
+    conflicts: dict[tuple[str, str], list[dict]] = {}
+    pairs_scanned = 0
+    for i, a in enumerate(selected):
+        for b in selected[i + 1 :]:
+            pairs_scanned += 1
+            sites = _heterodimer_conflict_sites(
+                a,
+                seq_of[a],
+                b,
+                seq_of[b],
+                salt_conc=salt_conc,
+                temperature=temperature,
+                min_bp=min_bp,
+            )
+            if sites:
+                conflicts[(a, b)] = sites
+
+    base = {
+        "salt_conc": salt_conc,
+        "temperature": temperature,
+        "min_bp": min_bp,
+        "primer_ids": selected,
+        "primer_count": len(selected),
+        "units": units_meta,
+        "force_pair_count": len(norm_pairs),
+        "max_pools": max_pools,
+        "pairs_scanned": pairs_scanned,
+        "conflicting_primer_pairs": len(conflicts),
+    }
+
+    def site_worst(sites: list[dict]) -> str:
+        return max(sites, key=lambda s: _RISK_ORDER[s["risk"]])["risk"]
+
+    def conflict_entries(pool_no: dict | None = None) -> list[dict]:
+        entries: list[dict] = []
+        for i, a in enumerate(selected):
+            for b in selected[i + 1 :]:
+                sites = conflicts.get((a, b))
+                if not sites:
+                    continue
+                entry = {
+                    "primer_a": a,
+                    "primer_b": b,
+                    "unit_a": f"u{unit_of[a]}",
+                    "unit_b": f"u{unit_of[b]}",
+                    "site_count": len(sites),
+                    "worst_risk": site_worst(sites),
+                    "sites": sites,
+                }
+                if pool_no is not None:
+                    entry["pool_a"] = pool_no[a]
+                    entry["pool_b"] = pool_no[b]
+                    entry["same_pool"] = pool_no[a] == pool_no[b]
+                entries.append(entry)
+        return entries
+
+    # -- 3) 单元内冲突：被强制同池的引物本身 high/critical → 无解 ------------
+    forced_conflicts: list[dict] = []
+    for ui, mem in enumerate(units):
+        for x in range(len(mem)):
+            for y in range(x + 1, len(mem)):
+                a, b = mem[x], mem[y]
+                sites = conflicts.get((a, b))
+                if sites:
+                    forced_conflicts.append(
+                        {
+                            "unit_id": f"u{ui}",
+                            "primer_a": a,
+                            "primer_b": b,
+                            "site_count": len(sites),
+                            "sites": sites,
+                        }
+                    )
+    if forced_conflicts:
+        detail = "；".join(
+            f"{fc['primer_a']} × {fc['primer_b']}（{fc['site_count']} 个 "
+            "high/critical 位点）"
+            for fc in forced_conflicts
+        )
+        return {
+            **base,
+            "feasible": False,
+            "reason": "forced_pair_conflict",
+            "message": (
+                "以下被指定为必须同池的引物对之间存在 high/critical 异源二聚体，"
+                f"强制同池即冲突，无法给出有效方案：{detail}。"
+                "请解除该同池对、更换引物或放宽配对后重算。"
+            ),
+            "forced_conflicts": forced_conflicts,
+            "conflicts": conflict_entries(),
+        }
+
+    # -- 4) 单元冲突图 ------------------------------------------------------
+    n = len(units)
+    adj = [0] * n
+    for (a, b) in conflicts:
+        ua, ub = unit_of[a], unit_of[b]
+        if ua == ub:
+            continue  # 单元内冲突已在上一步处理
+        x, y = (ua, ub) if ua < ub else (ub, ua)
+        adj[x] |= 1 << y
+        adj[y] |= 1 << x
+
+    # -- 5) 从 1 池起精确求最小可行池数（受上限约束）------------------------
+    colors: list[int] | None = None
+    pool_count = 0
+    for k in range(1, max_pools + 1):
+        cand = _exact_kcolor(n, adj, k)
+        if cand is not None:
+            colors, pool_count = cand, k
+            break
+
+    if colors is None:
+        # 上限内不可着色：继续求真实色数与最大团，给出可操作的无解原因。
+        chromatic = n
+        for k in range(1, n + 1):
+            if _exact_kcolor(n, adj, k) is not None:
+                chromatic = k
+                break
+        clique = _maximum_clique(n, adj)
+        clique_members = [pid for ui in clique for pid in units[ui]]
+        if len(clique) > max_pools:
+            message = (
+                f"存在 {len(clique)} 个两两冲突的分池单元"
+                f"（{'、'.join(clique_members)}），至少需要 {len(clique)} 个池，"
+                f"超过池数上限 {max_pools}，无法给出有效方案。"
+                "可提高池数上限（最高 6）、解除某些必须同池对或移除引物后重算。"
+            )
+        else:
+            message = (
+                f"冲突图在 {max_pools} 个池内无法完成着色（最少需要 "
+                f"{chromatic} 个池），最大两两冲突组为 "
+                f"{'、'.join(clique_members) or '（无）'}（{len(clique)} 个单元）。"
+                "可提高池数上限（最高 6）、解除某些必须同池对或移除引物后重算。"
+            )
+        return {
+            **base,
+            "feasible": False,
+            "reason": "pool_limit_exceeded",
+            "message": message,
+            "chromatic_number": chromatic,
+            "max_clique": {
+                "size": len(clique),
+                "unit_ids": [f"u{ui}" for ui in clique],
+                "members": clique_members,
+            },
+            "conflicts": conflict_entries(),
+        }
+
+    # -- 6) 构造方案：池按「最早成员在任务中的位置」稳定编号 ----------------
+    buckets: dict[int, list[int]] = {}
+    for ui, c in enumerate(colors):
+        buckets.setdefault(c, []).append(ui)
+    ordered_colors = sorted(
+        buckets,
+        key=lambda c: min(order[pid] for ui in buckets[c] for pid in units[ui]),
+    )
+    pools: list[dict] = []
+    pool_no: dict[str, int] = {}
+    for idx, c in enumerate(ordered_colors, start=1):
+        uis = sorted(buckets[c], key=lambda ui: min(order[p] for p in units[ui]))
+        members = [pid for ui in uis for pid in units[ui]]
+        for pid in members:
+            pool_no[pid] = idx
+        pools.append(
+            {
+                "pool": idx,
+                "unit_ids": [f"u{ui}" for ui in uis],
+                "members": members,
+                "size": len(members),
+            }
+        )
+
+    for meta in units_meta:
+        meta["pool"] = pool_no[meta["members"][0]]
+
+    if pool_count == 1:
+        message = "选中引物间没有 high/critical 异源二聚体，1 个池即可容纳全部引物。"
+    else:
+        message = f"在池数上限 {max_pools} 内找到最少 {pool_count} 池方案。"
+
+    return {
+        **base,
+        "feasible": True,
+        "reason": None,
+        "message": message,
+        "pool_count": pool_count,
+        "pools": pools,
+        "conflicts": conflict_entries(pool_no),
+    }

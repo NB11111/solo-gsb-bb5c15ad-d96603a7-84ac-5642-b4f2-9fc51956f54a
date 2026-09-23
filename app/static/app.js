@@ -29,10 +29,25 @@ const els = {
   sensMsg: $("#sensMsg"),
   sensResult: $("#sensResult"),
   sensExport: $("#btnSensExport"),
+  mxBox: $("#multiplexBox"),
+  mxSalt: $("#mxSalt"),
+  mxTemp: $("#mxTemp"),
+  mxMbp: $("#mxMbp"),
+  mxPicker: $("#mxPrimerPicker"),
+  mxCount: $("#mxCount"),
+  mxPairs: $("#mxPairs"),
+  mxAddPair: $("#btnMxAddPair"),
+  mxMaxPools: $("#mxMaxPools"),
+  mxRun: $("#btnMxRun"),
+  mxMsg: $("#mxMsg"),
+  mxResult: $("#mxResult"),
+  mxExport: $("#btnMxExport"),
 };
 
 let lastResponse = null; // { job_id, result }
 let lastSensitivity = null; // { job_id, sensitivity }
+let lastMultiplex = null; // { job_id, multiplex }
+let mxState = { primerIds: [], selected: new Set(), pairs: [] }; // 当前任务引物与表单状态
 
 /* ---------------- 工具 ---------------- */
 
@@ -139,6 +154,7 @@ function renderResult(data) {
 
   // 条件敏感性分析需要可引用的历史任务；纯导出态（无 job_id）时隐藏。
   resetSensitivity();
+  resetMultiplex(data.result);
 
   const cards = [
     [r.primer_count, "引物数量"],
@@ -528,6 +544,272 @@ function exportSensitivityJson() {
   URL.revokeObjectURL(a.href);
 }
 
+/* ---------------- 多重 PCR 分池 ---------------- */
+
+function setMxMsg(text, kind = "") {
+  els.mxMsg.textContent = text;
+  els.mxMsg.className = "msg" + (kind ? " " + kind : "");
+}
+
+/* 载入新结果时重置分池面板（保留原表单状态：引物集合变化才清空）。 */
+function resetMultiplex(result) {
+  els.mxBox.hidden = !lastResponse || !lastResponse.job_id;
+  const ids = result.summary.primers.map((p) => p.primer_id);
+  const same = ids.length === mxState.primerIds.length
+    && ids.every((id, i) => id === mxState.primerIds[i]);
+  if (!same) {
+    mxState = {
+      primerIds: ids,
+      selected: new Set(ids.slice(0, Math.min(ids.length, 12))),
+      pairs: [],
+    };
+  }
+  els.mxSalt.textContent = result.salt_conc;
+  els.mxTemp.textContent = result.temperature;
+  els.mxMbp.textContent = result.min_bp;
+  lastMultiplex = null;
+  els.mxResult.hidden = true;
+  els.mxResult.innerHTML = "";
+  setMxMsg("");
+  els.mxExport.disabled = true;
+  renderMxForm();
+}
+
+function toggleMxPrimer(id, on) {
+  if (on) {
+    if (mxState.selected.size >= 12) {
+      setMxMsg("最多选择 12 条引物。", "err");
+      renderMxForm();
+      return;
+    }
+    mxState.selected.add(id);
+  } else {
+    mxState.selected.delete(id);
+    // 取消勾选时移除包含该引物的同池对
+    mxState.pairs = mxState.pairs.filter((p) => p[0] !== id && p[1] !== id);
+  }
+  setMxMsg("");
+  renderMxForm();
+}
+
+function addMxPair() {
+  const avail = mxState.primerIds.filter(
+    (id) => mxState.selected.has(id) && !mxState.pairs.some((p) => p[0] === id || p[1] === id));
+  if (avail.length < 2) {
+    setMxMsg("至少需要 2 条已勾选且尚未配对的引物才能添加同池对。", "err");
+    return;
+  }
+  mxState.pairs.push([avail[0], avail[1]]);
+  setMxMsg("");
+  renderMxForm();
+}
+
+function removeMxPair(index) {
+  mxState.pairs.splice(index, 1);
+  setMxMsg("");
+  renderMxForm();
+}
+
+function changeMxPairEnd(index, end, value) {
+  mxState.pairs[index][end] = value;
+  renderMxForm();
+}
+
+function renderMxForm() {
+  const ids = mxState.primerIds;
+  els.mxCount.textContent = mxState.selected.size;
+  els.mxCount.className = mxState.selected.size >= 2 && mxState.selected.size <= 12 ? "mx-ok" : "mx-bad";
+
+  els.mxPicker.innerHTML = ids.map((id) => {
+    const on = mxState.selected.has(id);
+    return `<label class="mx-chip${on ? " on" : ""}">
+      <input type="checkbox" data-mxpid="${esc(id)}" ${on ? "checked" : ""} />
+      <span>${esc(id)}</span>
+    </label>`;
+  }).join("");
+  els.mxPicker.querySelectorAll("[data-mxpid]").forEach((node) =>
+    node.addEventListener("change", () => toggleMxPrimer(node.dataset.mxpid, node.checked)));
+
+  if (!mxState.pairs.length) {
+    els.mxPairs.innerHTML = `<div class="hint" style="margin:4px 0">尚未指定同池对（不指定时每条引物自成一个分池单元）。</div>`;
+  } else {
+    const inPairs = new Set(mxState.pairs.flat());
+    els.mxPairs.innerHTML = mxState.pairs.map((pair, index) => {
+      const optionsFor = (end) => mxState.primerIds
+        .filter((id) => mxState.selected.has(id)
+          && id !== pair[end ^ 1] // 同一对的两端不能选同一条引物
+          && (id === pair[end] || !inPairs.has(id)))
+        .map((id) => `<option value="${esc(id)}"${id === pair[end] ? " selected" : ""}>${esc(id)}</option>`)
+        .join("");
+      return `<div class="mx-pair-row">
+        <span class="mx-pair-idx">${index + 1}</span>
+        <select data-mxpair="${index}" data-mxend="0">${optionsFor(0)}</select>
+        <span class="mx-pair-x">必须同池 ×</span>
+        <select data-mxpair="${index}" data-mxend="1">${optionsFor(1)}</select>
+        <button class="btn tiny danger" data-mxrm="${index}" type="button">移除</button>
+      </div>`;
+    }).join("");
+    els.mxPairs.querySelectorAll("select[data-mxpair]").forEach((node) =>
+      node.addEventListener("change", () =>
+        changeMxPairEnd(Number(node.dataset.mxpair), Number(node.dataset.mxend), node.value)));
+    els.mxPairs.querySelectorAll("[data-mxrm]").forEach((node) =>
+      node.addEventListener("click", () => removeMxPair(Number(node.dataset.mxrm))));
+  }
+
+  // 每条引物至多属于一对：已配对的引物不再可选
+  const pairedCount = new Set(mxState.pairs.flat()).size;
+  els.mxAddPair.disabled = mxState.selected.size - pairedCount < 2
+    || mxState.pairs.length >= 6;
+}
+
+/* ---- 结果渲染 ---- */
+
+function mxSiteLine(site) {
+  return `<div class="mx-site ${site.risk}">
+    ${badge(RISK_CN[site.risk] + "风险", site.risk)}
+    ${site.anchored_three_prime ? badge("3′ 锚定 · 可延伸", "critical") : ""}
+    <span class="mono">${esc(site.primer_a)} [${site.interval_a[0]}–${site.interval_a[1]}]</span>
+    <span style="color:var(--muted)">×</span>
+    <span class="mono">${esc(site.primer_b)} [${site.interval_b[0]}–${site.interval_b[1]}]</span>
+    <span>${site.bp} bp · GC ${site.gc_pairs} · Tm ${site.tm}°C</span>
+  </div>`;
+}
+
+function renderMultiplex(data) {
+  lastMultiplex = data;
+  const m = data.multiplex;
+  els.mxResult.hidden = false;
+  els.mxExport.disabled = false;
+
+  const unitLabel = (uid) => {
+    const u = m.units.find((x) => x.unit_id === uid);
+    return u && u.forced_pair ? `${uid}（同池绑定）` : uid;
+  };
+
+  const conflictsHtml = m.conflicts.length
+    ? `<div class="mx-conflicts">
+        <h5>不可同池的引物对（${m.conflicts.length} 对，全量重算 ${m.pairs_scanned} 对，共 ${m.conflicting_primer_pairs} 对冲突）</h5>
+        ${m.conflicts.map((c) => `
+          <div class="mx-conflict ${c.worst_risk}">
+            <div class="mx-conflict-head">
+              ${badge(RISK_CN[c.worst_risk] + "风险", c.worst_risk)}
+              <span class="mono"><b>${esc(c.primer_a)}</b> × <b>${esc(c.primer_b)}</b></span>
+              <span class="hint" style="margin:0">${unitLabel(c.unit_a)} ↔ ${unitLabel(c.unit_b)} · ${c.site_count} 个 high/critical 位点${
+                m.feasible ? ` · 已分开到池 ${c.pool_a} / ${c.pool_b}` : ""
+              }</span>
+            </div>
+            ${c.sites.map(mxSiteLine).join("")}
+          </div>`).join("")}
+      </div>`
+    : `<p class="hint" style="margin:6px 0">✅ 所选引物两两之间均无 high/critical 异源二聚体。</p>`;
+
+  if (m.feasible) {
+    setMxMsg(`分池完成 ✓ 最少 ${m.pool_count} 个池（上限 ${m.max_pools}）`, "ok");
+    els.mxResult.innerHTML = `
+      <div class="mx-summary ok">
+        <b>✅ ${esc(m.message)}</b>
+        <span class="hint" style="margin:0">折叠后共 ${m.units.length} 个分池单元（其中 ${m.force_pair_count} 对同池绑定）。可调整配对或池数上限后重新计算。</span>
+      </div>
+      <div class="mx-pools">
+        ${m.pools.map((p) => `
+          <div class="mx-pool">
+            <div class="mx-pool-head">池 ${p.pool}<span class="mx-pool-size">${p.size} 条 · ${p.unit_ids.length} 单元</span></div>
+            <ul class="mx-pool-members">
+              ${p.members.map((id) => {
+                const uid = m.units.find((u) => u.members.includes(id)).unit_id;
+                const forced = m.units.find((u) => u.unit_id === uid).forced_pair;
+                return `<li><b>${esc(id)}</b><span class="mx-unit-tag">${uid}${forced ? " · 同池绑定" : ""}</span></li>`;
+              }).join("")}
+            </ul>
+          </div>`).join("")}
+      </div>
+      ${conflictsHtml}`;
+  } else if (m.reason === "forced_pair_conflict") {
+    setMxMsg("无法分池：必须同池的引物对内部存在冲突。", "err");
+    els.mxResult.innerHTML = `
+      <div class="mx-summary fail">
+        <b>⛔ ${esc(m.message)}</b>
+        <span class="hint" style="margin:0">单元内冲突无法靠分池解决——请在 ② 区移除/调整对应同池对，或更换引物后重算。</span>
+      </div>
+      <div class="mx-forced-fail">
+        ${m.forced_conflicts.map((fc) => `
+          <div class="mx-conflict critical">
+            <div class="mx-conflict-head">
+              ${badge("同池对内部冲突", "critical")}
+              <span class="mono"><b>${esc(fc.primer_a)}</b> × <b>${esc(fc.primer_b)}</b></span>
+              <span class="hint" style="margin:0">${fc.unit_id} · ${fc.site_count} 个 high/critical 位点</span>
+            </div>
+            ${fc.sites.map(mxSiteLine).join("")}
+          </div>`).join("")}
+      </div>
+      ${conflictsHtml}`;
+  } else {
+    setMxMsg(`无法分池：${m.max_pools} 个池上限内无可行方案。`, "err");
+    els.mxResult.innerHTML = `
+      <div class="mx-summary fail">
+        <b>⛔ ${esc(m.message)}</b>
+        <span class="hint" style="margin:0">冲突图精确色数为 ${m.chromatic_number}；最大两两冲突组 ${m.max_clique.size} 个单元（${
+          m.max_clique.members.map(esc).join("、")
+        }）。请提高池数上限、解除某些同池对或减少引物后重算——后端不会输出任何无效方案。</span>
+      </div>
+      ${conflictsHtml}`;
+  }
+}
+
+async function runMultiplex() {
+  if (!lastResponse || !lastResponse.job_id) {
+    setMxMsg("请先执行或载入一个已保存的历史任务。", "err");
+    return;
+  }
+  const ids = [...mxState.selected];
+  if (ids.length < 2 || ids.length > 12) {
+    setMxMsg(`请选择 2–12 条引物（当前 ${ids.length} 条）。`, "err");
+    return;
+  }
+  const maxPools = parseInt(els.mxMaxPools.value, 10);
+  if (!Number.isInteger(maxPools) || maxPools < 2 || maxPools > 6) {
+    setMxMsg("池数上限需为 2–6 之间的整数。", "err");
+    return;
+  }
+  const payload = {
+    primer_ids: ids,
+    force_pairs: mxState.pairs.filter((p) => p[0] && p[1] && p[0] !== p[1]),
+    max_pools: maxPools,
+  };
+  els.mxRun.disabled = true;
+  setMxMsg("全量重算异源二聚体并搜索最少池数中…");
+  try {
+    const resp = await fetch(`/api/jobs/${lastResponse.job_id}/multiplex`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await resp.json();
+    if (!resp.ok) {
+      const detail = typeof body.detail === "string"
+        ? body.detail
+        : JSON.stringify(body.detail ?? "");
+      setMxMsg("请求失败（" + resp.status + "）：" + detail, "err");
+      return;
+    }
+    renderMultiplex(body);
+  } catch (e) {
+    setMxMsg("网络错误：" + e.message, "err");
+  } finally {
+    els.mxRun.disabled = false;
+  }
+}
+
+function exportMultiplexJson() {
+  if (!lastMultiplex) return;
+  const blob = new Blob([JSON.stringify(lastMultiplex, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `primer-multiplex-${lastMultiplex.job_id}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 /* ---------------- 绑定 ---------------- */
 
 els.run.addEventListener("click", runScreen);
@@ -537,5 +819,8 @@ els.format.addEventListener("click", formatJson);
 els.refreshJobs.addEventListener("click", loadJobs);
 els.sensRun.addEventListener("click", runSensitivity);
 els.sensExport.addEventListener("click", exportSensitivityJson);
+els.mxAddPair.addEventListener("click", addMxPair);
+els.mxRun.addEventListener("click", runMultiplex);
+els.mxExport.addEventListener("click", exportMultiplexJson);
 
 loadJobs();

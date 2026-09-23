@@ -11,8 +11,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
-from .models import ScreenRequest, SensitivityRequest
-from .screen import screen_primers, sensitivity_scan
+from .models import MultiplexRequest, ScreenRequest, SensitivityRequest
+from .screen import MultiplexError, multiplex_partition, screen_primers, sensitivity_scan
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -154,6 +154,42 @@ def post_sensitivity(job_id: str, payload: SensitivityRequest) -> dict:
         "job_id": job_id,
         "job_name": job["name"],
         "sensitivity": analysis,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 多重 PCR 分池（复用历史任务的引物与盐浓度 / 温度 / min_bp，全量重算
+# 所选引物间异源二聚体后求最少池数）
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/jobs/{job_id}/multiplex")
+def post_multiplex(job_id: str, payload: MultiplexRequest) -> dict:
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404, detail="任务不存在或已被删除，无法执行多重 PCR 分池"
+        )
+
+    req = job["request"]
+    primers = [(p["id"], p["sequence"]) for p in req["primers"]]
+    try:
+        partition = multiplex_partition(
+            primers,
+            payload.primer_ids,
+            [tuple(pair) for pair in payload.force_pairs],
+            payload.max_pools,
+            salt_conc=float(req["salt_conc"]),
+            temperature=float(req["temperature"]),
+            min_bp=int(req.get("min_bp", 4)),
+        )
+    except MultiplexError as exc:
+        # 请求可修正的语义错误（引物不属于任务 / 同池对重叠等）→ 422。
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "job_id": job_id,
+        "job_name": job["name"],
+        "multiplex": partition,
     }
 
 
