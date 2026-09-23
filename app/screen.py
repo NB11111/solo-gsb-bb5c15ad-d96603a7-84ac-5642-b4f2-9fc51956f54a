@@ -1081,3 +1081,350 @@ def sensitivity_scan(
         "events_shown": len(events_out),
         "events_capped": len(items) > SENSITIVITY_EVENT_CAP,
     }
+
+
+# ---------------------------------------------------------------------------
+# 多重 PCR 分池
+# ---------------------------------------------------------------------------
+#
+# 从一个历史任务中选取 2-12 条引物做多重 PCR 分池：
+#
+# 1. 用任务保存的盐浓度 / Tm 阈值 / min_bp **重新全量扫描**所选引物两两之间的
+#    异源二聚体——筛选结果里的 dimers 列表只含 medium 及以上且最多 200 条，
+#    已被截断或被判为 low 的位点不能用来推断冲突；
+# 2. 任一 high / critical 异源二聚体位点构成一条「不可同池」边，同一条引物对
+#    可以挂多个位点（页面展示各自的冲突区间）；
+# 3. 先按用户指定、互不重叠的「必须同池」引物对把引物折叠为单元（每个单元
+#    至多含 2 条引物），单元内部若存在冲突边则直接判定不可行，不产出方案；
+# 4. 对单元冲突图求精确 chromatic number（顶点 ≤ 12，回溯足够快），返回不超过
+#    池数上限的最少池数着色；上限内无解时说明原因。
+
+POOL_SELECTION_MIN = 2
+POOL_SELECTION_MAX = 12
+POOL_LIMIT_MIN = 2
+POOL_LIMIT_MAX = 6
+
+
+class _DSU:
+    """极简并查集，用于把必须同池的引物折叠成单元。"""
+
+    def __init__(self, items: Iterable[str]):
+        self.parent = {x: x for x in items}
+
+    def find(self, x: str) -> str:
+        root = x
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[x] != root:
+            self.parent[x], x = root, self.parent[x]
+        return root
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
+def _heterodimer_site(
+    id_a: str,
+    seq_a: str,
+    id_b: str,
+    seq_b: str,
+    seg: Segment,
+    *,
+    salt_conc: float,
+    temperature: float,
+) -> dict:
+    """单个异源二聚体位点的对外描述（1-based 区间 + 三行配对展示）。"""
+
+    top, middle, bottom = alignment_strings(seq_a, seq_b, seg)
+    tm_base, tm = simplified_tm(top, salt_conc)
+    anchored = seg.a_end == len(seq_a) and seg.b_end == len(seq_b)
+    risk = _dimer_risk(seg, tm, temperature, anchored)
+    return {
+        "interval_a": [seg.a_start + 1, seg.a_end],
+        "interval_b": [seg.b_start + 1, seg.b_end],
+        "bp": seg.length,
+        "matches": seg.matches,
+        "gc_pairs": _gc_count(top),
+        "tm_base": round(tm_base, 2),
+        "tm": round(tm, 2),
+        "anchored_three_prime": anchored,
+        "risk": risk,
+        "alignment": {
+            "top_5to3": top,
+            "pairs": middle,
+            "bottom_3to5": bottom,
+        },
+    }
+
+
+def _max_clique(adj: dict[int, set[int]]) -> list[int]:
+    """Bron-Kerbosch（带 pivot）求最大团；顶点 ≤ 12，直接枚举即可。"""
+
+    n = len(adj)
+    best: set[int] = set()
+
+    def bk(r: set[int], p: set[int], x: set[int]) -> None:
+        nonlocal best
+        if len(r) + len(p) <= len(best):
+            return
+        if not p and not x:
+            best = set(r)
+            return
+        u = max(p | x, key=lambda v: len(adj[v] & p))
+        for v in list(p - adj[u]):
+            bk(r | {v}, p & adj[v], x & adj[v])
+            p = p - {v}
+            x = x | {v}
+
+    bk(set(), set(range(n)), set())
+    return sorted(best)
+
+
+def _exact_k_coloring(adj: dict[int, set[int]], k: int) -> list[int] | None:
+    """判断图是否可 k 着色，可行时返回每个顶点的颜色编号（0-based）。
+
+    按度数降序赋值；候选颜色只取「已用过的颜色 + 一个新颜色」，利用颜色
+    对称性剪枝。顶点最多 12 个，穷尽搜索很快。
+    """
+
+    n = len(adj)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda v: (-len(adj[v]), v))
+    colors = [-1] * n
+
+    def assign(pos: int, used_colors: int) -> bool:
+        if pos == n:
+            return True
+        v = order[pos]
+        blocked = {colors[u] for u in adj[v] if colors[u] >= 0}
+        # 颜色对称：只尝试已出现的颜色和恰好一个新颜色，不尝试跳过新颜色。
+        for c in range(min(k, used_colors + 1)):
+            if c in blocked:
+                continue
+            colors[v] = c
+            if assign(pos + 1, max(used_colors, c + 1)):
+                return True
+        colors[v] = -1
+        return False
+
+    return colors if assign(0, 0) else None
+
+
+def _sorted_sites(sites: list[dict]) -> list[dict]:
+    return sorted(sites, key=lambda s: (-_RISK_ORDER[s["risk"]], -s["tm"], s["bp"]))
+
+
+def _intra_unit_reason(intra: list[dict]) -> str:
+    parts: list[str] = []
+    for edge in intra:
+        top = edge["sites"][0]
+        parts.append(
+            f"必须同池的引物对 {edge['primer_a']} 与 {edge['primer_b']} 之间存在 "
+            f"{edge['site_count']} 个 high/critical 异源二聚体位点"
+            f"（最严重为 {edge['worst_risk']}：{edge['primer_a']} "
+            f"{top['interval_a'][0]}-{top['interval_a'][1]} ↔ {edge['primer_b']} "
+            f"{top['interval_b'][0]}-{top['interval_b'][1]}，Tm {top['tm']}°C），"
+            "二者无法放入同一池"
+        )
+    return "；".join(parts) + "。"
+
+
+def multiplex_pooling(
+    selected: list[tuple[str, str]],
+    *,
+    forced_pairs: list[tuple[str, str]],
+    max_pools: int,
+    salt_conc: float,
+    temperature: float,
+    min_bp: int = DEFAULT_MIN_BP,
+) -> dict:
+    """对选中的引物执行多重 PCR 分池。
+
+    ``selected`` 为按用户选择顺序排列的 ``[(id, 5'->3' 序列), ...]``，
+    长度 2-12；``forced_pairs`` 为互不重叠的必须同池引物对；``max_pools``
+    为池数上限（2-6）。冲突位点完全按给定的盐浓度 / Tm 阈值 / min_bp
+    重新扫描，不读取历史筛选结果中可能已被截断的事件明细。
+    """
+
+    ids = [pid for pid, _ in selected]
+
+    # 1) 先把必须同池引物对折叠为单元（迭代顺序即选择顺序，单元编号稳定）。
+    dsu = _DSU(ids)
+    for a, b in forced_pairs:
+        dsu.union(a, b)
+    root_to_idx: dict[str, int] = {}
+    units: list[dict] = []
+    for pid in ids:
+        root = dsu.find(pid)
+        if root not in root_to_idx:
+            root_to_idx[root] = len(units)
+            units.append({"unit_id": f"U{len(units) + 1}", "members": [], "forced": False})
+        units[root_to_idx[root]]["members"].append(pid)
+    forced_pair_set = {frozenset(pair) for pair in forced_pairs}
+    for unit in units:
+        unit["forced"] = frozenset(unit["members"]) in forced_pair_set
+    unit_idx_of = {
+        pid: idx for idx, unit in enumerate(units) for pid in unit["members"]
+    }
+
+    # 2) 全量重算所选引物两两异源二聚体，high/critical 位点才构成冲突边。
+    primer_edges: dict[tuple[int, int], list[dict]] = {}
+    for i, (id_a, seq_a) in enumerate(selected):
+        for j in range(i + 1, len(selected)):
+            id_b, seq_b = selected[j]
+            segs = scan_antiparallel(seq_a, seq_b, min_bp=min_bp)
+            sites = []
+            for seg in segs:
+                site = _heterodimer_site(
+                    id_a, seq_a, id_b, seq_b, seg,
+                    salt_conc=salt_conc, temperature=temperature,
+                )
+                if site["risk"] in ("high", "critical"):
+                    site["primer_a"] = id_a
+                    site["primer_b"] = id_b
+                    sites.append(site)
+            if sites:
+                primer_edges[(i, j)] = _sorted_sites(sites)
+
+    # 3) 折叠到单元层：区分单元内冲突（直接不可行）与单元间冲突（着色约束）。
+    intra: list[dict] = []
+    inter: dict[tuple[int, int], list[dict]] = {}
+    for (i, j), sites in primer_edges.items():
+        id_a, id_b = ids[i], ids[j]
+        ui, uj = unit_idx_of[id_a], unit_idx_of[id_b]
+        if ui == uj:
+            intra.append(
+                {
+                    "primer_a": id_a,
+                    "primer_b": id_b,
+                    "unit_a": units[ui]["unit_id"],
+                    "unit_b": units[uj]["unit_id"],
+                    "site_count": len(sites),
+                    "worst_risk": sites[0]["risk"],
+                    "sites": sites,
+                }
+            )
+        else:
+            key = (min(ui, uj), max(ui, uj))
+            inter.setdefault(key, []).extend(sites)
+
+    intra.sort(key=lambda e: (-_RISK_ORDER[e["worst_risk"]], e["primer_a"], e["primer_b"]))
+
+    adj: dict[int, set[int]] = {i: set() for i in range(len(units))}
+    for ui, uj in inter:
+        adj[ui].add(uj)
+        adj[uj].add(ui)
+
+    # 4) 最少池数：先求最大团作下界，再从下界起逐个尝试精确 k 着色。
+    feasible = True
+    infeasible_reason: str | None = None
+    coloring: list[int] | None = None
+    if intra:
+        feasible = False
+        infeasible_reason = _intra_unit_reason(intra)
+    else:
+        clique = _max_clique(adj)
+        for k in range(max(1, len(clique)), max_pools + 1):
+            coloring = _exact_k_coloring(adj, k)
+            if coloring is not None:
+                break
+        else:
+            coloring = None
+        if coloring is None:
+            feasible = False
+            if len(clique) > max_pools:
+                members = [pid for i in clique for pid in units[i]["members"]]
+                infeasible_reason = (
+                    f"冲突图至少需要 {len(clique)} 个池：引物 "
+                    f"{'、'.join(members)} 两两之间都存在 high/critical 异源二聚体，"
+                    f"互为冲突的 {len(clique)} 个单元必须各占一池，超过池数上限 "
+                    f"{max_pools}。"
+                )
+            else:
+                infeasible_reason = (
+                    f"在池数上限 {max_pools} 内无解：穷尽搜索表明该冲突图至少需要 "
+                    f"{max_pools + 1} 个池，请放宽必须同池配对、提高池数上限或调整引物。"
+                )
+
+    pools: list[dict] = []
+    if feasible and coloring is not None:
+        grouped: dict[int, list[int]] = {}
+        for ui, color in enumerate(coloring):
+            grouped.setdefault(color, []).append(ui)
+        for color in sorted(grouped):
+            members = [
+                pid
+                for ui in grouped[color]
+                for pid in units[ui]["members"]
+            ]
+            pools.append(
+                {
+                    "pool": color + 1,
+                    "unit_ids": [units[ui]["unit_id"] for ui in grouped[color]],
+                    "members": members,
+                }
+            )
+
+    def pool_of(ui: int) -> int | None:
+        return coloring[ui] + 1 if coloring is not None else None
+
+    conflicts: list[dict] = []
+    for edge in intra:
+        conflicts.append(
+            {
+                **edge,
+                "same_unit": True,
+                "pool_a": None,
+                "pool_b": None,
+            }
+        )
+    for (ui, uj), sites in inter.items():
+        sites = _sorted_sites(sites)
+        conflicts.append(
+            {
+                "primer_a": ids_in_unit(units, ui),
+                "primer_b": ids_in_unit(units, uj),
+                "unit_a": units[ui]["unit_id"],
+                "unit_b": units[uj]["unit_id"],
+                "site_count": len(sites),
+                "worst_risk": sites[0]["risk"],
+                "sites": sites,
+                "same_unit": False,
+                "pool_a": pool_of(ui),
+                "pool_b": pool_of(uj),
+            }
+        )
+    conflicts.sort(
+        key=lambda e: (
+            0 if e["same_unit"] else 1,
+            -_RISK_ORDER[e["worst_risk"]],
+            e["unit_a"],
+            e["unit_b"],
+        )
+    )
+
+    return {
+        "feasible": feasible,
+        "params": {
+            "salt_conc": salt_conc,
+            "temperature": temperature,
+            "min_bp": min_bp,
+        },
+        "primer_ids": ids,
+        "max_pools": max_pools,
+        "units": units,
+        "pool_count": len(pools) if feasible else None,
+        "pools": pools,
+        "conflicts": conflicts,
+        "infeasible_reason": infeasible_reason,
+    }
+
+
+def ids_in_unit(units: list[dict], idx: int) -> str:
+    """冲突边展示用：单元只有 1 条引物时返回该 id，否则返回 "A/B" 简述。"""
+
+    members = units[idx]["members"]
+    return members[0] if len(members) == 1 else "/".join(members)

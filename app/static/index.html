@@ -110,6 +110,36 @@
           <div id="sensMsg" class="msg"></div>
           <div id="sensResult" hidden></div>
         </div>
+
+        <!-- 多重 PCR 分池 -->
+        <div id="poolingBox" class="pooling-box">
+          <div class="result-head">
+            <h3>🧪 多重 PCR 分池（按任务条件全量重算异源二聚体）</h3>
+            <button id="btnPoolExport" class="btn ghost tiny" type="button" disabled>⬇ 下载分池 JSON</button>
+          </div>
+          <p class="hint">
+            从本任务选择 <b>2–12 条</b>引物、指定 <b>互不重叠</b>的「必须同池」引物对，并设置
+            <b>池数上限（2–6）</b>。后端用任务保存的盐浓度 / Tm 阈值 / min_bp
+            <b>重新全量扫描</b>所选引物两两异源二聚体（不读取可能已截断的事件明细），
+            任一 high/critical 位点构成不可同池边；先折叠必须同池对，再求不超过上限的最少池数。
+          </p>
+          <div class="pool-select" id="poolPrimerList"></div>
+          <div class="pool-controls">
+            <div class="pool-pairs-field">
+              <label class="field-label" for="poolPairs">必须同池引物对（每行一对，两个 id 用 <code>,</code> 或空白分隔；各对互不重叠）</label>
+              <textarea id="poolPairs" spellcheck="false" placeholder="Primer_F2, Normal_F3&#10;Primer_R2, ..."></textarea>
+            </div>
+            <div class="pool-side">
+              <label class="field-label" for="poolMax">池数上限（2–6）</label>
+              <input id="poolMax" type="number" value="4" min="2" max="6" step="1" />
+              <div class="sens-run">
+                <button id="btnPoolRun" class="btn primary" type="button">▶ 计算分池</button>
+              </div>
+            </div>
+          </div>
+          <div id="poolMsg" class="msg"></div>
+          <div id="poolResult" hidden></div>
+        </div>
       </div>
     </section>
   </main>

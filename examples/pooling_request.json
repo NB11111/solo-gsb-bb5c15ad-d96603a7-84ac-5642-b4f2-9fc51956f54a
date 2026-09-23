@@ -1,0 +1,5 @@
+{
+  "primer_ids": ["Hairpin_F1", "Primer_F2", "Primer_R2", "Normal_F3"],
+  "forced_pairs": [["Hairpin_F1", "Normal_F3"]],
+  "max_pools": 4
+}

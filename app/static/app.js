@@ -29,10 +29,21 @@ const els = {
   sensMsg: $("#sensMsg"),
   sensResult: $("#sensResult"),
   sensExport: $("#btnSensExport"),
+  poolBox: $("#poolingBox"),
+  poolPrimerList: $("#poolPrimerList"),
+  poolPairs: $("#poolPairs"),
+  poolMax: $("#poolMax"),
+  poolRun: $("#btnPoolRun"),
+  poolMsg: $("#poolMsg"),
+  poolResult: $("#poolResult"),
+  poolExport: $("#btnPoolExport"),
 };
 
 let lastResponse = null; // { job_id, result }
 let lastSensitivity = null; // { job_id, sensitivity }
+let lastPooling = null; // { job_id, pooling }
+let poolPrimers = []; // 当前任务引物 [{id, sequence, risk?}]
+let poolChecked = new Set(); // 勾选的引物 id
 
 /* ---------------- 工具 ---------------- */
 
@@ -139,6 +150,8 @@ function renderResult(data) {
 
   // 条件敏感性分析需要可引用的历史任务；纯导出态（无 job_id）时隐藏。
   resetSensitivity();
+  resetPooling();
+  renderPoolPrimerList();
 
   const cards = [
     [r.primer_count, "引物数量"],
@@ -528,6 +541,259 @@ function exportSensitivityJson() {
   URL.revokeObjectURL(a.href);
 }
 
+/* ---------------- 多重 PCR 分池 ---------------- */
+
+function resetPooling() {
+  els.poolBox.hidden = !lastResponse || !lastResponse.job_id;
+  lastPooling = null;
+  poolPrimers = [];
+  poolChecked = new Set();
+  els.poolPrimerList.innerHTML = "";
+  els.poolPairs.value = "";
+  els.poolMax.value = "4";
+  els.poolResult.hidden = true;
+  els.poolResult.innerHTML = "";
+  setPoolMsg("", "");
+  els.poolExport.disabled = true;
+}
+
+function setPoolMsg(text, kind = "") {
+  els.poolMsg.textContent = text;
+  els.poolMsg.className = "msg" + (kind ? " " + kind : "");
+}
+
+/* 从当前表单 JSON 解析 id->sequence；解析失败时退回结果页 discard 信息。 */
+function currentPrimerMap() {
+  try {
+    const parsed = JSON.parse(els.json.value);
+    return new Map(normalizePrimers(parsed).map((p) => [p.id, p.sequence]));
+  } catch (e) {
+    return new Map();
+  }
+}
+
+function renderPoolPrimerList() {
+  const seqMap = currentPrimerMap();
+  const worst = new Map();
+  const r = lastResponse && lastResponse.result;
+  if (r) {
+    for (const p of r.summary.primers) {
+      if (p.worst_risk !== "low") worst.set(p.primer_id, p.worst_risk);
+    }
+  }
+  poolPrimers = Array.from(seqMap.keys())
+    .filter((id) => r && r.summary.primers.some((p) => p.primer_id === id))
+    .map((id) => {
+      const p = r.summary.primers.find((x) => x.primer_id === id);
+      return { id, sequence: seqMap.get(id) || "", risk: (p && p.worst_risk) || "low" };
+    });
+  if (!poolPrimers.length) {
+    els.poolPrimerList.innerHTML = `<div class="empty" style="padding:8px 0">无法读取该任务的引物列表，请重新载入任务。</div>`;
+    return;
+  }
+  els.poolPrimerList.innerHTML = poolPrimers.map((p) => {
+    const checked = poolChecked.has(p.id) ? "checked" : "";
+    const riskTag = p.risk !== "low" ? badge(RISK_CN[p.risk] + "风险", p.risk) : "";
+    return `<label class="pool-primer" title="${esc(p.sequence || "序列不可用，请重新载入任务")}">
+      <input type="checkbox" data-pid="${esc(p.id)}" ${checked} />
+      <span class="mono">${esc(p.id)}</span>${riskTag}
+    </label>`;
+  }).join("");
+  els.poolPrimerList.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      const pid = cb.dataset.pid;
+      if (cb.checked) {
+        poolChecked.add(pid);
+        return;
+      }
+      poolChecked.delete(pid);
+      // 去掉包含该引物的必须同池对（逐行解析，用户正在输入的非法行保留）。
+      removePairLineUsing(pid);
+    });
+  });
+}
+
+/* 取消勾选引物时，直接从文本框中删掉引用它的行，保留其余（含非法）行。 */
+function removePairLineUsing(pid) {
+  const kept = els.poolPairs.value
+    .split("\n")
+    .filter((line) => line.trim())
+    .filter((line) => {
+      try {
+        const ids = parsePoolPairs(line)[0];
+        return !ids.includes(pid);
+      } catch (e) {
+        return true;
+      }
+    });
+  els.poolPairs.value = kept.join("\n");
+}
+
+/* 解析 textarea：每行一对，分隔符为逗号/空白（兼容 JSON 风格 ["A","B"] 等写法）。 */
+function parsePoolPairs(raw) {
+  const pairs = [];
+  const lines = String(raw).split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const ids = line.replace(/[\[\]"'`]/g, "").split(/[\s,，;；/]+/).filter(Boolean);
+    if (ids.length !== 2) {
+      throw new Error(`无法解析必须同池对（每行需恰好 2 个引物 id）：${line}`);
+    }
+    pairs.push(ids);
+  }
+  return pairs;
+}
+
+function poolSiteRow(site) {
+  const anc = site.anchored_three_prime ? badge("3′ 锚定 · 可延伸", "critical") : "";
+  return `<div class="pool-site">
+    <div class="event-title">
+      ${badge(RISK_CN[site.risk] + "风险", site.risk)}
+      ${anc}
+      <span class="who mono">${esc(site.primer_a)}</span>
+      <span style="color:var(--muted)">×</span>
+      <span class="who mono">${esc(site.primer_b)}</span>
+    </div>
+    <div class="event-meta">
+      <span>${esc(site.primer_a)} 区间 <b>${site.interval_a[0]}–${site.interval_a[1]}</b></span>
+      <span>${esc(site.primer_b)} 区间 <b>${site.interval_b[0]}–${site.interval_b[1]}</b></span>
+      <span>配对 <b>${site.bp}</b> bp</span>
+      <span>GC <b>${site.gc_pairs}</b></span>
+      <span>Tm <b>${site.tm}°C</b> <span style="opacity:.7">(无盐 ${site.tm_base}°C)</span></span>
+    </div>
+    ${alignmentBlock(site.alignment)}
+  </div>`;
+}
+
+function renderPooling(data) {
+  lastPooling = data;
+  const p = data.pooling;
+  els.poolResult.hidden = false;
+  els.poolExport.disabled = false;
+
+  if (!p.feasible) {
+    els.poolResult.innerHTML = `
+      <div class="pool-infeasible">
+        <h4>⛔ 在上限 ${p.max_pools} 池内无法完成分池</h4>
+        <div>${esc(p.infeasible_reason || "存在无法消解的冲突。")}</div>
+        <p class="hint" style="margin:8px 0 0">不会输出无效方案。可调整必须同池配对、提高池数上限，或回到筛选结果更换引物后重算。</p>
+      </div>
+      ${renderPoolConflicts(p.conflicts, false)}`;
+    return;
+  }
+
+  const unitNote = p.units.some((u) => u.forced)
+    ? `<p class="hint" style="margin:6px 0 0">标签 U1、U2… 为按必须同池对折叠后的单元；池内按勾选顺序列出引物。</p>`
+    : "";
+  const pools = p.pools.map((pool) => `
+    <div class="pool-card">
+      <h4>池 ${pool.pool} <span class="hint" style="margin:0">（单元 ${pool.unit_ids.map(esc).join("、")}，${pool.members.length} 条）</span></h4>
+      <ul class="pool-members">${pool.members.map((m) => `<li class="mono">${esc(m)}</li>`).join("")}</ul>
+    </div>`).join("");
+
+  els.poolResult.innerHTML = `
+    <div class="pool-ok">
+      <h4>✅ 最少需要 ${p.pool_count} 个池（上限 ${p.max_pools}）</h4>
+      <div class="pool-cards">${pools}</div>
+      ${unitNote}
+    </div>
+    ${renderPoolConflicts(p.conflicts, true)}`;
+}
+
+function renderPoolConflicts(conflicts, feasible) {
+  if (!conflicts.length) {
+    return `<p class="hint" style="margin-top:10px">所选引物两两之间均无 high/critical 异源二聚体位点，全部引物可同池。</p>`;
+  }
+  const head = feasible
+    ? `<h4>⚔️ 不可同池冲突位点（${conflicts.length} 对单元，已被分配到不同池）</h4>`
+    : `<h4>⚔️ 冲突位点明细（${conflicts.length} 对单元）</h4>`;
+  const items = conflicts.map((c) => {
+    const tag = c.same_unit
+      ? badge(`同单元 ${esc(c.unit_a)} · 强制同池冲突`, "critical")
+      : badge(`${esc(c.unit_a)} → 池 ${c.pool_a} · ${esc(c.unit_b)} → 池 ${c.pool_b}`, "tag");
+    return `<details class="pool-conflict ${c.same_unit ? "critical" : c.worst_risk}"${c.same_unit ? " open" : ""}>
+      <summary>
+        ${badge(RISK_CN[c.worst_risk] + "风险", c.worst_risk)}
+        <span class="mono">${esc(c.primer_a)}</span>
+        <span style="color:var(--muted)">×</span>
+        <span class="mono">${esc(c.primer_b)}</span>
+        ${tag}
+        <span class="hint" style="margin:0">${c.site_count} 个位点</span>
+      </summary>
+      <div class="pool-site-list">${c.sites.map(poolSiteRow).join("")}</div>
+    </details>`;
+  }).join("");
+  return `<div class="pool-conflicts">${head}<p class="hint">冲突边仅统计 high/critical 异源二聚体（发卡与自二聚体不影响分池）；位点均按任务保存条件全量重扫得到。</p>${items}</div>`;
+}
+
+async function runPooling() {
+  if (!lastResponse || !lastResponse.job_id) {
+    setPoolMsg("请先执行或载入一个已保存的历史任务。", "err");
+    return;
+  }
+  const ids = Array.from(poolChecked);
+  if (ids.length < 2 || ids.length > 12) {
+    setPoolMsg(`请选择 2–12 条引物（当前选了 ${ids.length} 条）。`, "err");
+    return;
+  }
+  let forcedPairs;
+  try {
+    forcedPairs = parsePoolPairs(els.poolPairs.value);
+  } catch (e) {
+    setPoolMsg(e.message, "err");
+    return;
+  }
+  const idSet = new Set(ids);
+  const badRef = forcedPairs.flat().find((x) => !idSet.has(x));
+  if (badRef) {
+    setPoolMsg(`必须同池对中的引物 ${badRef} 不在已勾选的引物中。`, "err");
+    return;
+  }
+  const maxPools = parseInt(els.poolMax.value, 10);
+  if (!(maxPools >= 2 && maxPools <= 6)) {
+    setPoolMsg("池数上限需为 2–6 的整数。", "err");
+    return;
+  }
+  // 勾选顺序 = 任务引物顺序，保证池内成员展示与选择顺序一致。
+  const order = new Map(poolPrimers.map((p, i) => [p.id, i]));
+  const orderedIds = ids.slice().sort((a, b) => order.get(a) - order.get(b));
+  els.poolRun.disabled = true;
+  setPoolMsg("全量重扫异源二聚体并搜索最少池数…");
+  try {
+    const resp = await fetch(`/api/jobs/${lastResponse.job_id}/pooling`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ primer_ids: orderedIds, forced_pairs: forcedPairs, max_pools: maxPools }),
+    });
+    const body = await resp.json();
+    if (!resp.ok) {
+      setPoolMsg("请求失败（" + resp.status + "）：" + (body.detail || ""), "err");
+      return;
+    }
+    const p = body.pooling;
+    setPoolMsg(
+      p.feasible
+        ? `分池完成 ✓ 最少 ${p.pool_count} 池（上限 ${p.max_pools}），冲突边 ${p.conflicts.length} 对。`
+        : `无法在 ${p.max_pools} 池内分池：已给出原因，未输出无效方案。`,
+      p.feasible ? "ok" : "err"
+    );
+    renderPooling(body);
+  } catch (e) {
+    setPoolMsg("网络错误：" + e.message, "err");
+  } finally {
+    els.poolRun.disabled = false;
+  }
+}
+
+function exportPoolingJson() {
+  if (!lastPooling) return;
+  const blob = new Blob([JSON.stringify(lastPooling, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `primer-pooling-${lastPooling.job_id}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 /* ---------------- 绑定 ---------------- */
 
 els.run.addEventListener("click", runScreen);
@@ -537,5 +803,7 @@ els.format.addEventListener("click", formatJson);
 els.refreshJobs.addEventListener("click", loadJobs);
 els.sensRun.addEventListener("click", runSensitivity);
 els.sensExport.addEventListener("click", exportSensitivityJson);
+els.poolRun.addEventListener("click", runPooling);
+els.poolExport.addEventListener("click", exportPoolingJson);
 
 loadJobs();

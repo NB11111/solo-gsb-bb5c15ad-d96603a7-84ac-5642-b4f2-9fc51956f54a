@@ -365,4 +365,126 @@ code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; b
   .sens-params { grid-template-columns: 1fr; }
   .change-cols { grid-template-columns: 1fr; }
   .sens-legend .base-swatch { margin-left: 0; flex-basis: 100%; }
+  .pool-controls { grid-template-columns: 1fr; }
 }
+
+/* ---------------- 多重 PCR 分池 ---------------- */
+
+.pooling-box {
+  margin-top: 26px;
+  padding-top: 18px;
+  border-top: 1px dashed var(--border);
+}
+.pool-select {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+.pool-primer {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 11px 3px 8px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.pool-primer:hover { border-color: var(--accent); }
+.pool-primer input { width: auto; margin: 0; accent-color: var(--accent); }
+.pool-controls {
+  display: grid;
+  grid-template-columns: 1fr 200px;
+  gap: 12px;
+  align-items: start;
+}
+.pool-pairs-field textarea { min-height: 76px; }
+.pool-side .sens-run { margin-top: 10px; }
+
+.pool-ok {
+  margin-top: 12px;
+  background: rgba(77, 213, 153, .08);
+  border: 1px solid var(--low);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.pool-ok h4 { margin: 0 0 10px; font-size: 14px; }
+.pool-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+.pool-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.pool-card h4 { margin: 0 0 8px; font-size: 13.5px; }
+.pool-members {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+}
+.pool-members li {
+  background: var(--panel-2);
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+
+.pool-infeasible {
+  margin-top: 12px;
+  background: rgba(255, 92, 122, .08);
+  border: 1px solid var(--critical);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 13.5px;
+}
+.pool-infeasible h4 { margin: 0 0 6px; font-size: 14px; }
+
+.pool-conflicts { margin-top: 14px; }
+.pool-conflicts h4 { margin: 0 0 4px; font-size: 14px; }
+.pool-conflict {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 8px;
+}
+.pool-conflict.critical { border-left: 3px solid var(--critical); }
+.pool-conflict.high { border-left: 3px solid var(--high); }
+.pool-conflict > summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 13px;
+}
+.pool-conflict > summary::-webkit-details-marker { display: none; }
+.pool-conflict > summary::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 11px;
+}
+.pool-conflict[open] > summary::before { content: "▾"; }
+.pool-site-list {
+  padding: 0 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pool-site {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.mono { font-family: var(--mono); }

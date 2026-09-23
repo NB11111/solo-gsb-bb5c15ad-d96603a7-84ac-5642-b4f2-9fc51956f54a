@@ -11,8 +11,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
-from .models import ScreenRequest, SensitivityRequest
-from .screen import screen_primers, sensitivity_scan
+from .models import PoolingRequest, ScreenRequest, SensitivityRequest
+from .screen import multiplex_pooling, screen_primers, sensitivity_scan
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -154,6 +154,54 @@ def post_sensitivity(job_id: str, payload: SensitivityRequest) -> dict:
         "job_id": job_id,
         "job_name": job["name"],
         "sensitivity": analysis,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 多重 PCR 分池（复用历史任务的引物与保存的盐浓度 / 温度 / min_bp，全量重算
+# 所选引物两两异源二聚体；保留原有筛选与敏感性分析接口）
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/jobs/{job_id}/pooling")
+def post_pooling(job_id: str, payload: PoolingRequest) -> dict:
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已被删除，无法执行多重 PCR 分池")
+
+    req = job["request"]
+    primer_map = {p["id"]: p["sequence"] for p in req["primers"]}
+
+    missing = [pid for pid in payload.primer_ids if pid not in primer_map]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail="以下引物 id 不属于该任务：" + "、".join(missing),
+        )
+
+    forced_pairs = [tuple(pair) for pair in payload.forced_pairs]
+    pair_ids = {pid for pair in forced_pairs for pid in pair}
+    not_selected = sorted(pair_ids - set(payload.primer_ids))
+    if not_selected:
+        raise HTTPException(
+            status_code=400,
+            detail="必须同池引物对中的以下引物未在所选引物中：" + "、".join(not_selected),
+        )
+
+    # 严格按用户选择顺序传入（保持池内成员展示顺序与选择顺序一致）。
+    selected = [(pid, primer_map[pid]) for pid in payload.primer_ids]
+    analysis = multiplex_pooling(
+        selected,
+        forced_pairs=forced_pairs,
+        max_pools=payload.max_pools,
+        salt_conc=float(req["salt_conc"]),
+        temperature=float(req["temperature"]),
+        min_bp=int(req.get("min_bp", 4)),
+    )
+    return {
+        "job_id": job_id,
+        "job_name": job["name"],
+        "pooling": analysis,
     }
 
 
